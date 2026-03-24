@@ -104,4 +104,4 @@ if __name__ == "__main__":
     meteo_pred = fetch_meteo(MEASUREMENTS_PRED, prediction="00")
     save_parquet(meteo_pred, "meteo_pred")
 
-    print("Tout bon")
+    print("ACQUISITION TERMINÉE")
