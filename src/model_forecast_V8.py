@@ -45,8 +45,8 @@ FORECAST_EXCLUDE = {
 #hyperparametre
 SLIDING_WINDOW_MONTHS = 18
 PV_HOURS = list(range(10, 17))#heures pv 
-PV_WEIGHT_DEFAULT = 1.7
-N_OPTUNA_TRIALS = 500
+PV_WEIGHT_DEFAULT = 1.6
+N_OPTUNA_TRIALS = 100
 MAX_BOOST_ROUNDS = 2000
 EARLY_STOPPING_ROUNDS = 50
 
@@ -85,7 +85,7 @@ def get_forecast_features(df: pl.DataFrame) -> list[str]:
       Train : tout avant le 30 sept 2024 22h UTC
       Val   : 30 sept 2024 22h -> 30 mars 2025 22h UTC (6 mois)
       Test  : apres le 30 mars 2025 22h UTC (~6 mois)
-""""
+"""
 
 def temporal_split(df: pl.DataFrame,
                    sliding_window_months: int | None = None):
