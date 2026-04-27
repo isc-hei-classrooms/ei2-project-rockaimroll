@@ -1,5 +1,5 @@
 import polars as pl
-from src.config import DATA_RAW, DATA_PROCESSED
+from archives.config import DATA_RAW, DATA_PROCESSED
 
 oiken = pl.read_parquet(DATA_RAW / "oiken_clean.parquet")
 meteo_r = pl.read_parquet(DATA_RAW / "meteo_real.parquet")
