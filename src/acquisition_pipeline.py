@@ -7,12 +7,13 @@ Execute dans l'ordre:
   3. acquisition_meteo_pred     -> data/raw/meteo_pred_raw.parquet
 
 Puis genere data/reports/acquisition_report.json avec les statistiques
-globales (lignes, sites, plage temporelle, sites complets/incomplets).
+globales (lignes, sites, leads pour la pred, plage temporelle).
 
 Pourquoi un orchestrateur separe plutot qu'un seul gros script ?
   - Chaque sous-module est lancable INDEPENDAMMENT pour debug.
   - L'orchestrateur peut paralleliser ou ajouter du cache si besoin
-    (les telechargements InfluxDB durent 5-15 min selon la connexion).
+    (les telechargements InfluxDB durent 5-30 min selon la connexion
+    et le nombre de leads acquis).
   - Le rapport global donne une vue d'ensemble avant de lancer la
     normalisation, ce qui evite de partir avec des donnees corrompues.
 
@@ -39,6 +40,7 @@ from src.config import (
     SITES,
     MEASUREMENTS_REAL,
     MEASUREMENTS_PRED,
+    PRED_LEAD_TIMES,
 )
 
 
@@ -109,7 +111,15 @@ def step_meteo_pred() -> dict:
 
     df = pl.read_parquet(DATA_RAW / "meteo_pred_raw.parquet")
 
-    return {
+    # Le parquet pred a maintenant une dimension supplementaire :
+    # lead_time. On la rapporte explicitement pour faciliter le debug
+    # de la normalisation en aval.
+    has_lead = "lead_time" in df.columns
+    leads_observed = (
+        sorted(df["lead_time"].unique().to_list()) if has_lead else []
+    )
+
+    out = {
         "status": "ok",
         "elapsed_s": round(dt, 1),
         "rows": df.height,
@@ -118,7 +128,12 @@ def step_meteo_pred() -> dict:
         "ts_min": str(df["timestamp"].min()),
         "ts_max": str(df["timestamp"].max()),
         "n_columns": df.shape[1],
+        "has_lead_time_dim": has_lead,
+        "n_lead_times_observed": len(leads_observed),
+        "lead_times_observed": leads_observed,
+        "lead_times_requested": PRED_LEAD_TIMES,
     }
+    return out
 
 
 # ============================================================
@@ -135,6 +150,7 @@ def cross_checks(report: dict) -> list[str]:
       - Meteo real et pred ont des plages temporelles compatibles
         avec la periode OIKEN
       - Tous les sites de SITES sont presents dans les sorties meteo
+      - Les leads demandes sont effectivement presents en pred
     """
     warnings_list: list[str] = []
 
@@ -167,6 +183,17 @@ def cross_checks(report: dict) -> list[str]:
                 f"meteo_pred: sites manquants {missing}"
             )
 
+        # Verification de la couverture des leads
+        requested = set(int(lt) for lt in pred.get("lead_times_requested", []))
+        observed = set(pred.get("lead_times_observed", []))
+        missing_leads = requested - observed
+        if missing_leads:
+            warnings_list.append(
+                f"meteo_pred: leads demandes mais absents : "
+                f"{sorted(missing_leads)}. Possible si COSMO-E ne "
+                f"publie pas systematiquement ces horizons."
+            )
+
     return warnings_list
 
 
@@ -187,7 +214,9 @@ def save_report(report: dict, name: str = "acquisition_report") -> Path:
 # ============================================================
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Pipeline d'acquisition OIKEN ML")
+    parser = argparse.ArgumentParser(
+        description="Pipeline d'acquisition OIKEN ML"
+    )
     parser.add_argument("--skip-oiken", action="store_true",
                         help="Saute l'acquisition OIKEN")
     parser.add_argument("--skip-meteo", action="store_true",
@@ -203,6 +232,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"# Sites    : {len(SITES)}")
     print(f"# Mesures  : {len(MEASUREMENTS_REAL)} reelles + "
           f"{len(MEASUREMENTS_PRED)} previsions")
+    print(f"# Leads    : {len(PRED_LEAD_TIMES)} "
+          f"('{PRED_LEAD_TIMES[0]}'..'{PRED_LEAD_TIMES[-1]}')")
     print("#" * 60 + "\n")
 
     t_start = time.time()
@@ -233,9 +264,12 @@ def main(argv: list[str] | None = None) -> int:
         if step in ("warnings", "total_elapsed_s", "steps"):
             continue
         status = info.get("status", "?")
+        extra = ""
+        if step == "meteo_pred" and info.get("has_lead_time_dim"):
+            extra = (f", {info.get('n_lead_times_observed', 0)} leads")
         print(f"  {step:15s}: {status:8s}  "
               f"({info.get('elapsed_s', 0):.1f}s, "
-              f"{info.get('rows', 0):,} rows)")
+              f"{info.get('rows', 0):,} rows{extra})")
 
     if warnings_list:
         print("\n  WARNINGS:")

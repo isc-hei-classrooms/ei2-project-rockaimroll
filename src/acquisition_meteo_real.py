@@ -53,8 +53,8 @@ from src.config import (
     SITES,
     MEASUREMENTS_REAL,
     MEASUREMENT_SHORT_NAMES,
-    OIKEN_START,
-    OIKEN_END,
+    METEO_START,
+    METEO_END,
 )
 
 # La librairie influxdb-client emet un warning chaque fois qu'on n'utilise
@@ -156,8 +156,8 @@ def fetch_one(
 def fetch_meteo_real(
     sites: list[str],
     measurements: list[str],
-    start: str = OIKEN_START,
-    stop: str = OIKEN_END,
+    start: str = METEO_START,
+    stop: str = METEO_END,
 ) -> tuple[pl.DataFrame, dict]:
     """
     Telecharge l'ensemble des combinaisons (site, mesure).
@@ -261,7 +261,7 @@ def main() -> int:
 
     print(f"\nSites    : {len(SITES)} -> {SITES}")
     print(f"Mesures  : {len(MEASUREMENTS_REAL)} (9 variables physiques)")
-    print(f"Periode  : {OIKEN_START} -> {OIKEN_END}")
+    print(f"Periode  : {METEO_START} -> {METEO_END}")
     print(f"Total    : {len(SITES)*len(MEASUREMENTS_REAL)} requetes Flux")
     print()
 

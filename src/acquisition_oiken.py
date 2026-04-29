@@ -26,6 +26,7 @@ Utilisation:
 
 from __future__ import annotations
 
+import argparse
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -34,8 +35,10 @@ import polars as pl
 
 from src.config import (
     DATA_RAW,
-    OIKEN_CSV_PATH,
-    OIKEN_EXPECTED_ROWS,
+    DATASETS,
+    DEFAULT_DATASET,
+    get_dataset_config,
+    get_oiken_raw_path,
 )
 
 
@@ -139,16 +142,37 @@ def load_oiken_csv(path: Path) -> pl.DataFrame:
     df = df.rename(COLUMN_RENAME)
 
     # ---- Parsing du timestamp ----
-    # Format observe: "01.10.2022 00:15" ou "1.10.2022 0:15" (selon export).
-    # On utilise le format strict, %d et %H acceptent 1 ou 2 chiffres.
-    # Si le format change, l'erreur sera explicite (pas de cast silencieux).
+    # Deux formats sont supportes pour gerer a la fois le CSV original
+    # OIKEN (DD.MM.YYYY HH:MM) et le golden dataset (DD/MM/YYYY HH:MM).
+    # Strategie : on essaie d'abord le format point (legacy), puis on
+    # complete avec le format slash sur les lignes encore null.
+    # strict=False fait que les lignes au mauvais format deviennent null
+    # plutot que de planter, ce qui permet le fallback.
     df = df.with_columns(
         pl.col("timestamp_local").str.strptime(
             pl.Datetime,
             format="%d.%m.%Y %H:%M",
-            strict=True,
+            strict=False,
+        ).alias("_ts_dot")
+    ).with_columns(
+        pl.col("timestamp_local").str.strptime(
+            pl.Datetime,
+            format="%d/%m/%Y %H:%M",
+            strict=False,
+        ).alias("_ts_slash")
+    ).with_columns(
+        pl.coalesce([pl.col("_ts_dot"), pl.col("_ts_slash")])
+        .alias("timestamp_local")
+    ).drop(["_ts_dot", "_ts_slash"])
+
+    # Verification : aucune ligne ne doit avoir timestamp_local null
+    # apres le parsing. Si oui, c'est qu'un troisieme format est arrive.
+    n_null_ts = df["timestamp_local"].null_count()
+    if n_null_ts > 0:
+        raise ValueError(
+            f"{n_null_ts} timestamps n'ont pu etre parses ni en format "
+            f"DD.MM.YYYY HH:MM ni en DD/MM/YYYY HH:MM. Verifier le CSV."
         )
-    )
 
     # ---- Parsing des colonnes numeriques ----
     # Le CSV OIKEN utilise le point decimal (verifie sur l'echantillon).
@@ -193,12 +217,13 @@ def _DEPRECATED_sort_warning():
     pass
 
 
-def quality_report(df: pl.DataFrame) -> dict:
+def quality_report(df: pl.DataFrame, expected_rows: int) -> dict:
     """
     Genere un rapport de qualite synthetique sur le DataFrame OIKEN.
 
     Verifications:
-      - Nombre de lignes vs attendu (105_120 = 3 ans en pas 15 min)
+      - Nombre de lignes vs attendu (depend du dataset, ex 105_120 pour
+        l'original 3 ans, 92_544 pour le golden 2.6 ans)
       - Nombre de nulls par colonne
       - Plage temporelle (min, max)
       - Doublons sur timestamp_local
@@ -207,7 +232,7 @@ def quality_report(df: pl.DataFrame) -> dict:
     Retour: dict avec les metriques (sera persiste en JSON par le pipeline).
     """
     n_rows = df.height
-    n_expected = OIKEN_EXPECTED_ROWS
+    n_expected = expected_rows
 
     nulls_per_col = {col: df[col].null_count() for col in df.columns}
 
@@ -254,41 +279,95 @@ def print_report(report: dict) -> None:
             print(f"    {col:25s}: {n}")
 
 
-def save_parquet(df: pl.DataFrame, name: str = "oiken_raw") -> Path:
+def save_parquet(df: pl.DataFrame, out_path: Path) -> Path:
     """Sauvegarde au format Parquet (compresse, typage preserve)."""
-    DATA_RAW.mkdir(parents=True, exist_ok=True)
-    out = DATA_RAW / f"{name}.parquet"
-    df.write_parquet(out)
-    return out
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(out_path)
+    return out_path
 
 
 # ============================================================
 # Point d'entree
 # ============================================================
 
-def main() -> int:
-    print("=" * 60)
-    print("ACQUISITION OIKEN")
-    print("=" * 60)
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Acquisition OIKEN - lecture du CSV source.",
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=list(DATASETS.keys()),
+        default=DEFAULT_DATASET,
+        help=(f"Nom du dataset a traiter (defaut : {DEFAULT_DATASET}). "
+              f"Configures dans config.DATASETS : {list(DATASETS.keys())}"),
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Traite tous les datasets configures, l'un apres l'autre. "
+             "Pratique pour relancer le pipeline complet.",
+    )
+    return parser.parse_args(argv)
 
-    print(f"\n[1/3] Lecture du CSV: {OIKEN_CSV_PATH}")
+
+def run_one_dataset(dataset_name: str) -> int:
+    """Acquiert un seul dataset. Retourne 0 si OK, code d'erreur sinon."""
+    cfg = get_dataset_config(dataset_name)
+    csv_path: Path = cfg["csv_path"]
+    expected_rows: int = cfg["expected_rows"]
+    label: str = cfg["label"]
+    out_path = get_oiken_raw_path(dataset_name)
+
+    print("=" * 60)
+    print(f"ACQUISITION OIKEN - dataset='{dataset_name}' ({label})")
+    print("=" * 60)
+    print(f"  CSV source  : {csv_path}")
+    print(f"  Sortie      : {out_path}")
+    print(f"  Lignes attendues : {expected_rows:,}")
+
+    print(f"\n[1/3] Lecture du CSV")
     try:
-        df = load_oiken_csv(OIKEN_CSV_PATH)
+        df = load_oiken_csv(csv_path)
     except FileNotFoundError as e:
         print(f"  ERREUR: {e}")
         return 1
     print(f"  Charge: {df.shape[0]:,} lignes, {df.shape[1]} colonnes")
 
     print("\n[2/3] Rapport qualite")
-    report = quality_report(df)
+    report = quality_report(df, expected_rows=expected_rows)
     print_report(report)
 
     print("\n[3/3] Sauvegarde Parquet")
-    out = save_parquet(df, "oiken_raw")
+    out = save_parquet(df, out_path)
     print(f"  -> {out}")
 
-    print("\nACQUISITION OIKEN TERMINEE")
+    print(f"\nACQUISITION OIKEN '{dataset_name}' TERMINEE")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    if args.all:
+        # Boucle sur tous les datasets configures. On ne s'arrete pas
+        # au premier echec : on essaie tous, on rapporte a la fin.
+        rc_total = 0
+        results: dict[str, int] = {}
+        for name in DATASETS.keys():
+            rc = run_one_dataset(name)
+            results[name] = rc
+            if rc != 0:
+                rc_total = rc
+            print()  # separation visuelle
+        print("=" * 60)
+        print("RESUME --all")
+        print("=" * 60)
+        for name, rc in results.items():
+            status = "OK" if rc == 0 else f"ECHEC (code {rc})"
+            print(f"  {name:15s} : {status}")
+        return rc_total
+
+    return run_one_dataset(args.dataset)
 
 
 if __name__ == "__main__":

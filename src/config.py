@@ -28,7 +28,11 @@ DATA_PROCESSED = PROJECT_ROOT / "data" / "processed"  # sorties normalisees
 DATA_REPORTS = PROJECT_ROOT / "data" / "reports"      # rapports qualite
 
 # Le CSV source OIKEN doit etre depose ici avant l'execution.
-OIKEN_CSV_PATH = DATA_RAW / "oikendata.csv"
+# Le nom exact depend du dataset choisi (cf section 7) :
+#   data/raw/oikendata_original.csv   (dataset "original")
+#   data/raw/oikendata_golden.csv     (dataset "golden")
+# La constante OIKEN_CSV_PATH (legacy) pointe sur le dataset par defaut
+# et est definie a la fin de la section 7.
 
 
 # ============================================================
@@ -42,11 +46,11 @@ INFLUXDB_TOKEN = (
 )
 INFLUXDB_ORG = "HESSOVS"
 INFLUXDB_BUCKET = "MeteoSuisse"        # bucket principal (real + pred)
-# Note: le bucket "MeteoSuissePrevision" existe aussi mais n'est pas
-# utilise ici. A verifier ulterieurement si son contenu est pertinent.
+# Note: le bucket "MeteoSuissePrevision" existe mais a ete verifie
+# vide via scripts.exploration. On l'ignore.
 
-# Timeout de requete Flux (s). Les requetes lourdes (3 ans, 32 fields)
-# peuvent depasser le defaut de 60s.
+# Timeout de requete Flux (ms). Les requetes lourdes (3 ans, 16 leads,
+# tous les sites) peuvent depasser le defaut de 60s.
 INFLUX_TIMEOUT_MS = 600_000  # 10 minutes
 
 
@@ -129,11 +133,55 @@ MEASUREMENTS_PRED = [
     for variant in PRED_VARIANTS
 ]
 
-# 4.c) Quel run de prevision utiliser ?
-# Les runs vont de "00" a "45" (= heure de lancement modulo 6h en realite,
-# COSMO-E tournant 4 fois par jour). Pour un forecast J+1 publie le matin
-# avant 06:00, on utilise le run "00" (lance a 00 UTC, disponible vers 03h).
-PRED_RUN = "00"
+# 4.c) SEMANTIQUE DU TAG InfluxDB "Prediction"
+# ============================================================
+# Le tag "Prediction" est le LEAD TIME : delai (en heures, zero-padde
+# sur 2 chiffres) entre l'instant ou la prevision a ete emise et
+# l'instant cible "_time". Ce N'EST PAS un identifiant de run de modele.
+#
+# Exemple verifie sur PRED_GLOB_ctrl @ Sion, _time = 2025-06-15 12:00 UTC :
+#   Prediction="01" -> 785.7 W/m2  (prevision faite a 11:00 UTC pour 12:00)
+#   Prediction="03" -> 818.4 W/m2  (prevision faite a 09:00 UTC pour 12:00)
+#   Prediction="06" -> 297.7 W/m2  (prevision faite a 06:00 UTC pour 12:00)
+#   Prediction="12" -> 458.9 W/m2  (prevision faite a 00:00 UTC pour 12:00)
+#   Prediction="24" -> 757.5 W/m2  (prevision faite a 12:00 UTC J-1)
+#   Prediction="33" -> 742.2 W/m2  (prevision faite a 03:00 UTC J-1)
+#
+# CAS PARTICULIER - leads "00" sur les variables CUMULEES :
+# Pour PRED_GLOB, PRED_DURSUN, PRED_TOT_PREC a Prediction="00", le cumul
+# est mathematiquement non defini (rien n'a encore ete cumule a t=0).
+# MeteoSuisse encode cela par la sentinelle -99999. C'est l'origine
+# du bug initialement diagnostique (cf reports/diag_pred_glob.txt).
+# On EXCLUT donc systematiquement Prediction="00" de l'acquisition.
+#
+# Pour un forecast J+1 publie le matin (run 00 UTC, dispo ~03 UTC),
+# les leads couvrant les 24h du jour J+1 sont 22 a 47. En pratique
+# COSMO-E publie peu de valeurs au-dela de 33h (verifie sur le diag).
+# On retient donc "18" a "33" (16 leads horaires) qui couvre :
+#   - run 00 UTC -> J+1 partiel (lead 22-33 sur les 24h du lendemain)
+#   - run 06 UTC -> J+1 quasi complet (lead 18-33 sur 16h du lendemain)
+# La selection finale d'un lead par instant cible se fait dans
+# normalization.py selon la regle metier choisie.
+
+# Liste des leads a recuperer en acquisition. Format : strings zero-padded.
+# Modifier ici pour elargir/restreindre la fenetre temporelle d'acquisition.
+PRED_LEAD_TIMES: list[str] = [f"{h:02d}" for h in range(18, 34)]  # "18" a "33"
+
+# Lead time par defaut a utiliser en aval (selection unique dans
+# normalization.py si l'on ne fait pas de stratagie multi-lead).
+# Doit etre present dans PRED_LEAD_TIMES.
+PRED_LEAD_TIME_DEFAULT: str = "24"
+assert PRED_LEAD_TIME_DEFAULT in PRED_LEAD_TIMES, (
+    f"PRED_LEAD_TIME_DEFAULT='{PRED_LEAD_TIME_DEFAULT}' doit etre dans "
+    f"PRED_LEAD_TIMES={PRED_LEAD_TIMES}"
+)
+
+# DEPRECATED - Garde pour retro-compatibilite avec d'anciens scripts
+# qui referenceraient encore cette constante. NE PLUS UTILISER.
+# Le tag "Prediction" a la valeur "00" donne :
+#   - pour les variables instantanees : l'analyse (etat initial du modele)
+#   - pour les variables cumulees : la sentinelle -99999 (bug initial)
+PRED_RUN = "00"  # noqa: deprecated
 
 
 # ============================================================
@@ -183,14 +231,131 @@ PV_MAX_KWH = 50_000.0     # plafond defensif (reseau OIKEN)
 
 
 # ============================================================
-# 7. Periode et fuseau
+# 7. Datasets et periode
 # ============================================================
-# Le CSV OIKEN couvre du 01.10.2022 00:15 au 29.09.2025 23:45 inclus,
-# soit 105'120 lignes en pas 15 min (= 3 ans en grille locale).
-OIKEN_START = "2022-10-01"  # bornes pour les requetes InfluxDB
-OIKEN_END   = "2025-09-30"
-OIKEN_EXPECTED_ROWS = 105_120
+# Le projet supporte plusieurs datasets OIKEN en parallele : on en
+# ajoute autant que necessaire dans la dict DATASETS. Chaque dataset
+# decrit un CSV source, sa plage temporelle attendue, et un label
+# affichable. Toutes les sorties (parquets et rapports) sont
+# automatiquement suffixees par le nom du dataset, ce qui permet de
+# faire tourner le pipeline plusieurs fois sans collision.
+#
+# Convention de nommage des fichiers de sortie :
+#   data/raw/oiken_raw_<name>.parquet
+#   data/processed/dataset_normalized_<name>.parquet
+#   data/processed/dataset_features_<name>.parquet
+#   data/processed/predictions_xgboost_cv_<name>.parquet
+#   data/models/xgboost_j1_final_<name>.json
+#   data/reports/model_xgboost_report_<name>.json
+#
+# La meteo (real + pred) reste PARTAGEE entre tous les datasets car
+# elle decrit les memes capteurs/previsions sur les memes plages
+# physiques. Donc pas de suffixe sur meteo_real_raw.parquet et
+# meteo_pred_raw.parquet.
 
+DATASETS: dict[str, dict] = {
+    "original": {
+        # CSV source dans data/raw/. Si tu utilises encore l'ancien nom
+        # "oikendata.csv", renomme-le ou ajoute un lien symbolique.
+        "csv_path": DATA_RAW / "oikendata_original.csv",
+        "expected_rows": 105_120,
+        "start": "2022-10-01",
+        "end": "2025-09-30",
+        "label": "Original (3 ans)",
+        # Pas d'override : utilise les defaults de model_XGBoost
+        # (N_FOLDS=5, TEST_SIZE_DAYS=60, MIN_TRAIN_DAYS=720).
+        # 720 + 5*60 = 1020 jours requis, dispo apres lags ~1064.
+    },
+    "golden": {
+        "csv_path": DATA_RAW / "oikendata_golden.csv",
+        "expected_rows": 92_544,
+        "start": "2023-09-01",
+        "end": "2026-04-22",
+        "label": "Golden (2.6 ans)",
+        # Le golden est trop court pour la stratégie CV par defaut :
+        # apres drop des lignes a lags incomplets (rolling 30j), il
+        # reste ~927 jours. Defauts requierent 720+5*60 = 1020 jours.
+        # Compromis : on baisse min_train_days a 600 (= 1.6 an), on
+        # garde N_FOLDS=5 et TEST_SIZE_DAYS=60 pour COMPARABILITE
+        # FOLD-PAR-FOLD avec original (memes fenetres de test 60j).
+        # Total requis : 600 + 5*60 = 900 jours, marge ~27 jours.
+        "cv_overrides": {
+            "min_train_days": 600,
+        },
+    },
+}
+
+# Dataset utilise par defaut si aucun --dataset n'est passe au script.
+DEFAULT_DATASET = "original"
+
+# Validation a l'import : detecter immediatement une faute de frappe
+# dans DEFAULT_DATASET plutot qu'au runtime.
+assert DEFAULT_DATASET in DATASETS, (
+    f"DEFAULT_DATASET={DEFAULT_DATASET!r} doit etre une cle de DATASETS "
+    f"({list(DATASETS.keys())})"
+)
+
+
+def get_dataset_config(name: str) -> dict:
+    """Retourne la config d'un dataset, leve ValueError si inconnu."""
+    if name not in DATASETS:
+        raise ValueError(
+            f"Dataset inconnu : {name!r}. "
+            f"Datasets configures : {list(DATASETS.keys())}"
+        )
+    return DATASETS[name]
+
+
+def get_oiken_raw_path(dataset: str) -> Path:
+    """Chemin du parquet brut OIKEN pour un dataset donne."""
+    get_dataset_config(dataset)  # validation
+    return DATA_RAW / f"oiken_raw_{dataset}.parquet"
+
+
+def get_normalized_path(dataset: str) -> Path:
+    """Chemin du parquet normalise pour un dataset donne."""
+    get_dataset_config(dataset)
+    return DATA_PROCESSED / f"dataset_normalized_{dataset}.parquet"
+
+
+def get_features_path(dataset: str) -> Path:
+    """Chemin du parquet features pour un dataset donne."""
+    get_dataset_config(dataset)
+    return DATA_PROCESSED / f"dataset_features_{dataset}.parquet"
+
+
+def get_model_path(dataset: str) -> Path:
+    """Chemin du modele XGBoost final pour un dataset donne."""
+    get_dataset_config(dataset)
+    return PROJECT_ROOT / "data" / "models" / f"xgboost_j1_final_{dataset}.json"
+
+
+def get_predictions_path(dataset: str) -> Path:
+    """Chemin des predictions CV pour un dataset donne."""
+    get_dataset_config(dataset)
+    return DATA_PROCESSED / f"predictions_xgboost_cv_{dataset}.parquet"
+
+
+def get_model_report_path(dataset: str) -> Path:
+    """Chemin du rapport modele JSON pour un dataset donne."""
+    get_dataset_config(dataset)
+    return DATA_REPORTS / f"model_xgboost_report_{dataset}.json"
+
+
+# ============================================================
+# 7bis. Constantes legacy (retrocompatibilite)
+# ============================================================
+# Ces constantes pointent vers le DEFAULT_DATASET. Elles existent pour
+# que le code legacy continue de tourner sans modification, mais les
+# nouveaux scripts doivent utiliser les helpers ci-dessus.
+_default = DATASETS[DEFAULT_DATASET]
+OIKEN_CSV_PATH = _default["csv_path"]
+OIKEN_START = _default["start"]
+OIKEN_END = _default["end"]
+OIKEN_EXPECTED_ROWS = _default["expected_rows"]
+
+METEO_START = OIKEN_START          # ou une autre date si tu veux décaler
+METEO_END   = "2026-04-27"
 # Fuseau dans lequel les timestamps OIKEN sont ETIQUETES.
 # Hypothese forte (a verifier en normalisation): le CSV est en heure
 # locale suisse, avec changements DST. Les timestamps sont des
